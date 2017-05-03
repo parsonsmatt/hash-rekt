@@ -1,13 +1,15 @@
-{-# LANGUAGE AllowAmbiguousTypes  #-}
-{-# LANGUAGE DataKinds            #-}
-{-# LANGUAGE FlexibleInstances    #-}
-{-# LANGUAGE OverloadedStrings    #-}
-{-# LANGUAGE PolyKinds            #-}
-{-# LANGUAGE ScopedTypeVariables  #-}
-{-# LANGUAGE TypeApplications     #-}
-{-# LANGUAGE TypeFamilies         #-}
-{-# LANGUAGE TypeOperators        #-}
-{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE AllowAmbiguousTypes   #-}
+{-# LANGUAGE ConstraintKinds       #-}
+{-# LANGUAGE DataKinds             #-}
+{-# LANGUAGE FlexibleInstances     #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedStrings     #-}
+{-# LANGUAGE PolyKinds             #-}
+{-# LANGUAGE ScopedTypeVariables   #-}
+{-# LANGUAGE TypeApplications      #-}
+{-# LANGUAGE TypeFamilies          #-}
+{-# LANGUAGE TypeOperators         #-}
+{-# LANGUAGE UndecidableInstances  #-}
 
 {-|
 Module      : Data.HashRecord.Internal
@@ -37,26 +39,68 @@ import           Prelude             hiding (lookup)
 
 -- | A 'HashRecord' is an extensible record, containing values of
 -- potentially different types and indexed by strings. The
-newtype HashRecord (k :: [*]) = HashRecord (HashMap String Dynamic)
+newtype HashRecord (k :: [*]) = HashRecord { getHashRecord :: HashMap String Dynamic }
 
 -- | The 'Record' type synonym is convenient for making type aliases for
--- records. It sorts the keys and values you provide to it.
+-- records. It sorts the keys and values you provide to it. You should
+-- /not/ construct these types yourself, as this breaks invariant. I should
+-- probably not even export the dang type constructor.
 type Record xs = HashRecord (Sort xs)
+
+-- | A helper class to convert the values contained in a 'HashRecord' into
+-- strings, so the whole thing can be shown.
+class ToStringMap a where
+    toStringMap :: a -> HashMap String String
+
+-- | The empty 'HashRecord' is easy. This is equivalent to an empty
+-- 'HashMap'.
+instance ToStringMap (HashRecord '[]) where
+    toStringMap _ = mempty
+
+-- | This constraint alias is repeated often. In order for the symbol @k@
+-- and the type @v@ to be entries in a 'HashRecord', the symbol must be an
+-- instance of 'KnownSymbol' and the type must be an instance of
+-- 'Typeable'.
+type MapEntry k v = (Typeable v, KnownSymbol k)
+
+-- | The inductive case is a little trickier. We pluck the first value out
+-- of the map. This requires that the @k@ symbol is a 'KnownSymbol', so
+-- that we can reflect the value and get the 'String' back. We index into
+-- the current record with that string, which requires the 'Typeable'
+-- constraint on the value. Finally,
+instance
+    ( MapEntry k v
+    , Show v
+    , ToStringMap (HashRecord xs)
+    ) => ToStringMap (HashRecord (k =: v ': xs)) where
+    toStringMap rec@(HashRecord record) =
+        Map.singleton (symbolVal (Proxy @k)) (show (lookup @k rec))
+        <> toStringMap (HashRecord record :: HashRecord xs)
 
 instance ToStringMap (HashRecord xs) => Show (HashRecord xs) where
     show = show . toStringMap
 
-class ToStringMap a where
-    toStringMap :: a -> HashMap String String
+-- | Defining equality on 'HashRecord's starts with the base case. Any two
+-- empty 'HashRecord's are equal.
+instance Eq (HashRecord '[]) where
+    _ == _ = True
 
-instance ToStringMap (HashRecord '[]) where
-    toStringMap _ = mempty
-
-instance (Typeable v, KnownSymbol k, Show v, ToStringMap (HashRecord xs)) => ToStringMap (HashRecord (k =: v ': xs)) where
-    toStringMap rec@(HashRecord record) =
-        Map.singleton (symbolVal (Proxy @k)) (show (lookup @k rec :: v))
-        <> toStringMap (HashRecord record :: HashRecord xs)
-
+-- | For the inductive case, we require that the types @k@ and @v@ are
+-- a valid 'MapEntry', that the @v@ type is an instance of 'Eq', and that
+-- we can compare the rest of the 'HashRecord' for equality. With those
+-- requirements satisfied, we can grab the element of type @v@ corresponding
+-- with the key @k@ from bo;h records, and compare them for equality. If these
+-- are equal, then we'll recurse, comparing the rest of the maps.
+instance
+    ( Eq v
+    , Eq (HashRecord xs)
+    , MapEntry k v
+    ) => Eq (HashRecord (k =: v ': xs)) where
+    HashRecord rec0 == HashRecord rec1 =
+        let this = ix rec0 == ix rec1
+            rest = (HashRecord rec0 :: HashRecord xs) == (HashRecord rec1 :: HashRecord xs)
+            ix rec = unsafeLookup @k "HashRecord.==" rec :: v
+         in this && rest
 
 -- | Construct an empty 'HashRecord'.
 empty :: HashRecord '[]
@@ -66,11 +110,9 @@ empty = HashRecord mempty
 -- a value at the term level.
 data (key :: Symbol) =: (a :: *)
 
+-- | Insert a value into the 'HashRecord'.
 insert
-    :: forall key val keys.
-    ( Typeable val
-    , KnownSymbol key
-    )
+    :: forall key val keys. MapEntry key val
     => val
     -> HashRecord keys
     -> HashRecord (InsertSorted key val keys)
@@ -137,21 +179,31 @@ type family SortHelper xs ys where
     SortHelper acc '[] = acc
     SortHelper acc (k =: v ': xs) = SortHelper (InsertSorted k v acc) xs
 
+-- | Looks up the given key in a 'HashRecord'. Intended to be used with
+-- TypeApplications.
+--
+-- >>> Rec.lookup @"foo" (Rec.insert @"foo" 'a' Rec.empty)
+-- 'a'
 lookup
-    :: forall key val keys.
-    ( Typeable val
-    , KnownSymbol key
-    , Lookup key val keys ~ val
-    )
+    :: forall key val keys. (MapEntry key val , Lookup' key keys ~ val)
     => HashRecord keys
     -> val
-lookup (HashRecord record) =
-    case Map.lookup (symbolVal (Proxy @key)) record of
-        Nothing -> error "HashRecord.lookup: key did not exist in map."
-        Just dyn  ->
-            case fromDynamic dyn of
-                Nothing -> error "HashRecord.lookup: value did not have the right type"
-                Just a -> a
+lookup = unsafeLookup @key "lookup". getHashRecord
+
+-- | Seriously, don't do this.
+unsafeLookup
+    :: forall k v. MapEntry k v
+    => String -- ^ The string note to call 'error' with when you done goofed
+    -> HashMap String Dynamic -- ^ The raw record.
+    -> v -- ^ The value. This can totally error. Beware!
+unsafeLookup err =
+    fromMaybe (oops "value did not have the right type: ")
+    . fromDynamic
+    . fromMaybe (oops "key did not exist in map: ")
+    . Map.lookup (symbolVal (Proxy @k))
+  where
+    oops :: forall a. String -> a
+    oops e = error ("HashRecord.unsafeLookup: " ++ e ++ err)
 
 delete
     :: forall key val keys.
@@ -169,9 +221,8 @@ testMap = insert @"foo" 'a' empty
 
 update
     :: forall key val1 val2 keys.
-    ( KnownSymbol key
+    ( MapEntry key val1
     , Typeable val2
-    , Typeable val1
     , Lookup' key keys ~ val1
     )
     => (val1 -> val2)
