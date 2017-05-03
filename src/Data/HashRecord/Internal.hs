@@ -292,7 +292,9 @@ union (HashRecord r0) (HashRecord r1) = HashRecord (Map.union r0 r1)
 -- lens functions like 'view', 'over', 'set', etc.
 --
 -- This lens requires that the field exists in the map, so you can't use it to
--- insert new values into the map. This is deeply unfortunate.
+-- insert new values into the map. This is deeply unfortunate, but it prevents
+-- you from trying to 'view' a field that doesn't exist. I bet there's
+-- a 'Traversal' or some similar business that can allow setting of fields.
 --
 -- >>> insert @"foo" 'a' empty ^. field @"foo"
 -- 'a'
