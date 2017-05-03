@@ -16,6 +16,7 @@ dependencies:
   - unordered-containers
   - aeson
   - text
+  - lens
 
 ghc-options:
   - -Wall -fno-warn-unused-do-bind

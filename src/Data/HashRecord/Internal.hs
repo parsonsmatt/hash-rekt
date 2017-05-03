@@ -5,6 +5,7 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings     #-}
 {-# LANGUAGE PolyKinds             #-}
+{-# LANGUAGE Rank2Types            #-}
 {-# LANGUAGE ScopedTypeVariables   #-}
 {-# LANGUAGE TypeApplications      #-}
 {-# LANGUAGE TypeFamilies          #-}
@@ -26,6 +27,7 @@ changes in here will /not/ be reflected in the major API version.
 -}
 module Data.HashRecord.Internal where
 
+import           Control.Lens        hiding ((.=))
 import           Data.Aeson
 import           Data.Aeson.Types
 import           Data.Dynamic        (Dynamic, Proxy (..), Typeable,
@@ -283,9 +285,31 @@ testMap :: HashRecord '["foo" =: Char]
 testMap = insert @"foo" 'a' empty
 
 -- | Take the union of the two maps. This function is left biased,
-union :: HashRecord keys1 -> HashRecord keys2 -> HashRecord (Union keys1 keys)
+union :: HashRecord keys1 -> HashRecord keys2 -> HashRecord (Union keys1 keys2)
 union (HashRecord r0) (HashRecord r1) = HashRecord (Map.union r0 r1)
 
+-- | 'field' provides a lens into a 'HashRecord', which lets you use all the fun
+-- lens functions like 'view', 'over', 'set', etc.
+--
+-- This lens requires that the field exists in the map, so you can't use it to
+-- insert new values into the map. This is deeply unfortunate.
+--
+-- >>> insert @"foo" 'a' empty ^. field @"foo"
+-- 'a'
+field
+    :: forall key val1 val2 keys keys'.
+    ( MapEntry key val1
+    , Typeable val2
+    , Lookup' key keys ~ val1
+    , UpdateAt key val2 keys ~ keys'
+    )
+    => Lens (HashRecord keys) (HashRecord keys') val1 val2
+field = lens getter setter
+  where
+    getter :: HashRecord keys -> val1
+    getter = lookup @key
+    setter :: HashRecord keys -> val2 -> HashRecord keys'
+    setter rec val2 = update @key (const val2) rec
 
 -- | This updates the value stored in the 'HashRecord', potentially
 -- changing it's type. Unlike 'Data.HashMap.Strict.update', this function
