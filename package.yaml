@@ -1,0 +1,22 @@
+name:                hash-rekt
+version:             0.1.0.0
+synopsis:            Slightly dirty extensible records
+description:         See the README.md for more information
+homepage:            https://github.com/parsonsmatt/hash-rekt#readme
+license:             BSD3
+author:              Matthew Parsons
+maintainer:          parsonsmatt@gmail.com
+copyright:           2017 Matthew Parsons
+category:            Web
+extra-source-files:
+- README.md
+
+dependencies:
+  - base >= 4.8 && < 5
+  - unordered-containers
+
+ghc-options:
+  - -Wall -fno-warn-unused-do-bind
+
+library:
+  source-dirs: src
