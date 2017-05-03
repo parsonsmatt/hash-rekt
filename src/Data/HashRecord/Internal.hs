@@ -30,6 +30,7 @@ import           Data.Aeson
 import           Data.Aeson.Types
 import           Data.Dynamic        (Dynamic, Proxy (..), Typeable,
                                       fromDynamic, toDyn)
+import           Data.Function       (on)
 import           Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as Map
 import           Data.Maybe          (fromMaybe)
@@ -156,11 +157,14 @@ empty = HashRecord mempty
 singleton :: forall key val. MapEntry key val => val -> HashRecord '[key =: val]
 singleton v = insert @key v empty
 
--- | '=:' is a type that pairs type level 'String's (aka 'Symbol's) with
--- a value at the term level.
+-- | '=:' is a type that pairs a type level 'String' (aka 'Symbol's) with
+-- an inhabited type.
 data (key :: Symbol) =: (a :: *)
 
 -- | Insert a value into the 'HashRecord'.
+--
+-- >>> insert @"foo" 'a' empty
+-- fromList [("foo", "'a'")]
 insert
     :: forall key val keys. MapEntry key val
     => val
@@ -230,6 +234,13 @@ type family SortHelper xs ys where
     SortHelper acc '[] = acc
     SortHelper acc (k =: v ': xs) = SortHelper (InsertSorted k v acc) xs
 
+type Union xs ys = UnionHelper '[] xs ys
+
+type family UnionHelper acc xs ys where
+    UnionHelper acc '[] '[] = acc
+    UnionHelper acc (k =: v ': xs) ys = UnionHelper (InsertSorted k v acc) xs ys
+    UnionHelper acc '[] (k =: v ': xs) = UnionHelper (InsertSorted k v acc) '[] xs
+
 -- | Looks up the given key in a 'HashRecord'. Intended to be used with
 -- TypeApplications.
 --
@@ -270,6 +281,11 @@ delete = HashRecord
 -- | The type signature is inferred. Hooray!
 testMap :: HashRecord '["foo" =: Char]
 testMap = insert @"foo" 'a' empty
+
+-- | Take the union of the two maps. This function is left biased,
+union :: HashRecord keys1 -> HashRecord keys2 -> HashRecord (Union keys1 keys)
+union (HashRecord r0) (HashRecord r1) = HashRecord (Map.union r0 r1)
+
 
 -- | This updates the value stored in the 'HashRecord', potentially
 -- changing it's type. Unlike 'Data.HashMap.Strict.update', this function
