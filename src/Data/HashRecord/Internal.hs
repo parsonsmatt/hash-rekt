@@ -36,7 +36,6 @@ import           Data.Functor.Classes
 import           Data.HashMap.Strict  (HashMap)
 import qualified Data.HashMap.Strict  as Map
 import           Data.Maybe           (fromMaybe)
-import           Data.Monoid          ((<>))
 import qualified Data.Text            as Text
 import           GHC.TypeLits         (CmpSymbol, ErrorMessage (..),
                                        KnownSymbol, Symbol, TypeError,
@@ -97,8 +96,8 @@ instance
     , ToStringMap (HashRecord' f xs)
     ) => ToStringMap (HashRecord' f (k =: v ': xs)) where
     toStringMap rec@(HashRecord record) =
-        Map.singleton (symbolVal (Proxy @k)) (showsPrec1 0 (lookup' @k rec) "")
-        <> toStringMap (HashRecord record :: HashRecord' f xs)
+        Map.insert (symbolVal (Proxy @k)) (showsPrec1 0 (lookup' @k rec) "")
+        $ toStringMap (HashRecord record :: HashRecord' f xs)
 
 instance ToStringMap (HashRecord' f xs) => Show (HashRecord' f xs) where
     show = show . toStringMap
@@ -173,7 +172,7 @@ instance
 
 -- | Construct an empty 'HashRecord'.
 empty :: HashRecord '[]
-empty = empty
+empty = HashRecord mempty
 
 -- | Construct an empty 'HashRecord''.
 empty' :: HashRecord' f '[]
@@ -215,36 +214,180 @@ singleton
     => val -> HashRecord' f '[key =: val]
 singleton v = insert @key v empty'
 
+-- | Looks up the given key in a 'HashRecord''. Intended to be used with
+-- TypeApplications.
+--
+-- >>> Rec.lookup @"foo" (Rec.insert @"foo" 'a' Rec.empty)
+-- 'a'
+lookup'
+    :: forall key val keys f.
+    ( MapEntry key val
+    , Lookup key keys ~ val
+    , Functor f
+    )
+    => HashRecord' f keys
+    -> f val
+lookup' = unsafeLookup @key "lookup" . getHashRecord
+
+lookup
+    :: forall key val keys.
+    ( MapEntry key val
+    , Lookup key keys ~ val
+    )
+    => HashRecord keys
+    -> val
+lookup = runIdentity . lookup' @key
+
+-- | Seriously, don't do this.
+unsafeLookup
+    :: forall k v f. (MapEntry k v, Functor f)
+    => String -- ^ The string note to call 'error' with when you done goofed
+    -> HashMap String (f Dynamic) -- ^ The raw record.
+    -> f v -- ^ The value. This can totally error. Beware!
+unsafeLookup err =
+    fmap
+        ( fromMaybe (oops "value did not have the right type: ")
+        . fromDynamic
+        )
+    . fromMaybe (oops "key did not exist in map: ")
+    . Map.lookup (symbolVal (Proxy @k))
+  where
+    oops :: forall a. String -> a
+    oops e = error ("HashRecord'.unsafeLookup: " ++ e ++ err)
+
+delete
+    :: forall key val keys f.
+    ( KnownSymbol key
+    , Lookup key keys ~ val
+    )
+    => HashRecord' f keys
+    -> HashRecord' f (Remove key keys)
+delete = HashRecord
+    . Map.delete (symbolVal (Proxy @key))
+    . getHashRecord
+
+-- | The type signature is inferred. Hooray!
+testMap :: HashRecord '["foo" =: Char]
+testMap = insert @"foo" 'a' empty
+
+-- | Take the union of the two maps. This function is left biased,
+union :: HashRecord' f keys1 -> HashRecord' f keys2 -> HashRecord' f (Union keys1 keys2)
+union (HashRecord r0) (HashRecord r1) = HashRecord (Map.union r0 r1)
+
+-- | Given a function that can transform an @f a@ into a @g a@ without any
+-- knowledge of the @a@s inside the @f@ (aka a Natural Transformation), map that
+-- transformation over the record.
+--
+-- >>> :t rmap (Just . runIdentity) (insert @"bar" 'a' empty)
+-- HashRecord' Maybe ["bar" =: Char]
+rmap :: (forall a. f a -> g a) -> HashRecord' f keys -> HashRecord' g keys
+rmap nat = HashRecord . Map.map nat . getHashRecord
+
+rtraverse
+    :: Applicative h
+    => (forall a. f a -> h (g a))
+    -> HashRecord' f keys
+    -> h (HashRecord' g keys)
+rtraverse k = fmap HashRecord . traverse k . getHashRecord
+
+testMaybeMap :: HashRecord' Maybe '["foo" =: Int]
+testMaybeMap = insert' @"foo" Nothing empty'
+
+-- | 'field' provides a lens into a 'HashRecord'', which lets you use all the fun
+-- lens functions like 'view', 'over', 'set', etc.
+--
+-- This lens requires that the field exists in the map, so you can't use it to
+-- insert new values into the map. This is deeply unfortunate, but it prevents
+-- you from trying to 'view' a field that doesn't exist. I bet there's
+-- a 'Traversal' or some similar business that can allow setting of fields.
+--
+-- >>> insert @"foo" 'a' empty ^. field @"foo"
+-- 'a'
+field
+    :: forall key val1 val2 keys keys'.
+    ( MapEntry key val1
+    , Typeable val2
+    , Lookup key keys ~ val1
+    , UpdateAt key val2 keys ~ keys'
+    )
+    => Lens (HashRecord keys) (HashRecord keys') val1 val2
+field afb (HashRecord record) =
+    afb (runIdentity $ unsafeLookup @key "field" record) <&> \newVal ->
+        HashRecord $
+            Map.update
+                (const . Just . Identity . toDyn $ newVal)
+                (symbolVal (Proxy @key))
+                record
+
+field'
+    :: forall key val1 val2 keys keys' f.
+    ( MapEntry key val1
+    , Typeable val2
+    , Lookup key keys ~ val1
+    , UpdateAt key val2 keys ~ keys'
+    , Functor f
+    )
+    => Lens (HashRecord' f keys) (HashRecord' f keys') (f val1) (f val2)
+field' afb (HashRecord record) =
+    afb (unsafeLookup @key "field'" record) <&> \newVal ->
+        HashRecord (Map.update (k newVal) (symbolVal (Proxy @key)) record)
+  where
+    k newVal = Just . const (fmap toDyn newVal)
+
+-- | This updates the value stored in the 'HashRecord'', potentially
+-- changing it's type. Unlike 'Data.HashMap.Strict.update', this function
+-- does not allow you to remove the entry if present. To remove an entry,
+-- you'll need to use 'delete'.
+--
+-- >>> lookup @"foo" (update @"foo" succ (insert @"foo" 'a' empty))
+-- 'b'
+update
+    :: forall key val1 val2 keys f.
+    ( MapEntry key val1
+    , Typeable val2
+    , Functor f
+    , Lookup key keys ~ val1
+    )
+    => (val1 -> val2)
+    -> HashRecord' f keys
+    -> HashRecord' f (UpdateAt key val2 keys)
+update f = update' @key (fmap f)
+
+update'
+    :: forall key val1 val2 keys f.
+    ( MapEntry key val1
+    , Typeable val2
+    , Lookup key keys ~ val1
+    , Functor f
+    )
+    => (f val1 -> f val2)
+    -> HashRecord' f keys
+    -> HashRecord' f (UpdateAt key val2 keys)
+update' f = HashRecord
+    . Map.update k (symbolVal (Proxy @key))
+    . getHashRecord
+  where
+    k = Just
+        . fmap toDyn
+        . f
+        . fmap
+            (fromMaybe (error "HashRecord'.update: The type cast failed somehow.")
+            . fromDynamic
+            )
 -- | '=:' is a type that pairs a type level 'String' (aka 'Symbol's) with
 -- an inhabited type.
 data (key :: Symbol) =: (a :: *)
 
--- | This type family looks up the key in the given list of key value
--- pairs, failing if the value is not what was anticipated or if the value
--- is not found in the map.
-type family Lookup key val key'vals where
-    Lookup k v '[] = TypeError (
-        'Text "The key \"" ':<>: 'Text k ':<>: 'Text "\" did not exist in the map."
-        ':$$: 'Text "Therefore, we can't get the value out of it."
-        )
-    Lookup k a (k =: a ': xs) = a
-    Lookup k b (k =: a ': xs) = TypeError (
-        'Text "The key \"" ':<>: 'Text k ':<>: 'Text "\" existed in the map, but contained the wrong type of value."
-        ':$$: 'Text "Expected type: " ':<>: 'ShowType b
-        ':$$: 'Text "But the map contained: " ':<>: 'ShowType a
-        )
-    Lookup k a (x =: b ': xs) = Lookup k a xs
-
 -- | This type family looks up the key in the list of key value pairs. If
 -- it doesn't exist, then it fails with a type error. Otherwise, it returns
 -- the key.
-type family Lookup' key key'vals where
-    Lookup' k '[] = TypeError (
+type family Lookup key key'vals where
+    Lookup k '[] = TypeError (
         'Text "The key \"" ':<>: 'Text k ':<>: 'Text "\" did not exist in the map."
         ':$$: 'Text "Therefore, we can't get the value out of it."
         )
-    Lookup' k (k =: a ': xs) = a
-    Lookup' k (x =: b ': xs) = Lookup' k xs
+    Lookup k (k =: a ': xs) = a
+    Lookup k (x =: b ': xs) = Lookup k xs
 
 type family Remove key keys where
     Remove k '[] = '[]
@@ -285,116 +428,3 @@ type family UnionHelper acc xs ys where
     UnionHelper acc '[] '[] = acc
     UnionHelper acc (k =: v ': xs) ys = UnionHelper (InsertSorted k v acc) xs ys
     UnionHelper acc '[] (k =: v ': xs) = UnionHelper (InsertSorted k v acc) '[] xs
-
--- | Looks up the given key in a 'HashRecord''. Intended to be used with
--- TypeApplications.
---
--- >>> Rec.lookup @"foo" (Rec.insert @"foo" 'a' Rec.empty)
--- 'a'
-lookup'
-    :: forall key val keys f.
-    ( MapEntry key val
-    , Lookup' key keys ~ val
-    , Functor f
-    )
-    => HashRecord' f keys
-    -> f val
-lookup' = unsafeLookup @key "lookup" . getHashRecord
-
-lookup
-    :: forall key val keys.
-    ( MapEntry key val
-    , Lookup' key keys ~ val
-    )
-    => HashRecord keys
-    -> val
-lookup = runIdentity . lookup' @key
-
--- | Seriously, don't do this.
-unsafeLookup
-    :: forall k v f. (MapEntry k v, Functor f)
-    => String -- ^ The string note to call 'error' with when you done goofed
-    -> HashMap String (f Dynamic) -- ^ The raw record.
-    -> f v -- ^ The value. This can totally error. Beware!
-unsafeLookup err =
-    fmap
-        (fromMaybe (oops "value did not have the right type: ")
-        . fromDynamic
-        )
-    . fromMaybe (oops "key did not exist in map: ")
-    . Map.lookup (symbolVal (Proxy @k))
-  where
-    oops :: forall a. String -> a
-    oops e = error ("HashRecord'.unsafeLookup: " ++ e ++ err)
-
-delete
-    :: forall key val keys f.
-    ( KnownSymbol key
-    , Lookup key val keys ~ val
-    )
-    => HashRecord' f keys
-    -> HashRecord' f (Remove key keys)
-delete = HashRecord
-    . Map.delete (symbolVal (Proxy @key))
-    . getHashRecord
-
--- | The type signature is inferred. Hooray!
-testMap :: HashRecord '["foo" =: Char]
-testMap = insert @"foo" 'a' empty
-
--- | Take the union of the two maps. This function is left biased,
-union :: HashRecord' f keys1 -> HashRecord' f keys2 -> HashRecord' f (Union keys1 keys2)
-union (HashRecord r0) (HashRecord r1) = HashRecord (Map.union r0 r1)
-
--- | 'field' provides a lens into a 'HashRecord'', which lets you use all the fun
--- lens functions like 'view', 'over', 'set', etc.
---
--- This lens requires that the field exists in the map, so you can't use it to
--- insert new values into the map. This is deeply unfortunate, but it prevents
--- you from trying to 'view' a field that doesn't exist. I bet there's
--- a 'Traversal' or some similar business that can allow setting of fields.
---
--- >>> insert @"foo" 'a' empty ^. field @"foo"
--- 'a'
-field
-    :: forall key val1 val2 keys keys'.
-    ( MapEntry key val1
-    , Typeable val2
-    , Lookup' key keys ~ val1
-    , UpdateAt key val2 keys ~ keys'
-    )
-    => Lens (HashRecord keys) (HashRecord keys') val1 val2
-field = lens getter setter
-  where
-    getter :: HashRecord keys -> val1
-    getter = lookup @key
-    setter :: HashRecord keys -> val2 -> HashRecord keys'
-    setter rec val2 = update @key (const val2) rec
-
--- | This updates the value stored in the 'HashRecord'', potentially
--- changing it's type. Unlike 'Data.HashMap.Strict.update', this function
--- does not allow you to remove the entry if present. To remove an entry,
--- you'll need to use 'delete'.
---
--- >>> lookup @"foo" (update @"foo" succ (insert @"foo" 'a' empty))
--- 'b'
-update
-    :: forall key val1 val2 keys.
-    ( MapEntry key val1
-    , Typeable val2
-    , Lookup' key keys ~ val1
-    )
-    => (val1 -> val2)
-    -> HashRecord keys
-    -> HashRecord (UpdateAt key val2 keys)
-update f = HashRecord
-    . Map.update k (symbolVal (Proxy @key))
-    . getHashRecord
-  where
-    k = Just
-        . Identity
-        . toDyn
-        . f
-        . fromMaybe (error "HashRecord'.update: The type cast failed somehow.")
-        . fromDynamic
-        . runIdentity
