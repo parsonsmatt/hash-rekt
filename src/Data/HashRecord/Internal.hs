@@ -57,14 +57,19 @@ newtype HashRecord' f (k :: [*])
     { getHashRecord :: HashMap String (f Dynamic)
     }
 
+-- | For simple cases, 'HashRecord' suffices. If all you want is type safe
+-- indexing into the 'Map' without worrying about partial values or validations,
+-- then this works great.
 type HashRecord = HashRecord' Identity
 
--- | The 'Record' type synonym is convenient for making type aliases for
+-- | The 'Record'' type synonym is convenient for making type aliases for
 -- records. It sorts the keys and values you provide to it. You should
 -- /not/ construct these types yourself, as this breaks invariant. I should
 -- probably not even export the dang type constructor.
 type Record' f xs = HashRecord' f (Sort xs)
 
+-- | Like 'HashRecord', this is useful when you only care about accessing the
+-- values.
 type Record xs = Record' Identity xs
 
 -- | A helper class to convert the values contained in a 'HashRecord' into
@@ -178,10 +183,13 @@ empty = HashRecord mempty
 empty' :: HashRecord' f '[]
 empty' = HashRecord mempty
 
--- | Insert a value into the 'HashRecord''.
+-- | Insert a value into the 'HashRecord''. It must be wrapped up in the @f@
+-- type constructor already.
 --
--- >>> insert @"foo" 'a' empty
--- fromList [("foo", "'a'")]
+-- >>> insert' @"foo" (Just 'a') empty'
+-- fromList [("foo", "Just 'a'")]
+-- >>> insert' @"bar" (Nothing :: Maybe Int) empty'
+-- fromList [("bar", "Nothing")]
 insert'
     :: forall key val keys f. (MapEntry key val, Functor f)
     => f val
@@ -191,10 +199,11 @@ insert' val = HashRecord
     . Map.insert (symbolVal (Proxy @key)) (toDyn <$> val)
     . getHashRecord
 
--- | Insert a value into the 'HashRecord''.
+-- | Insert a value into the 'HashRecord'. This lifts it into the @f@ context
+-- for you, which requires 'Applicative'.
 --
 -- >>> insert @"foo" 'a' empty
--- fromList [("foo", "'a'")]
+-- fromList [("foo", "Identity 'a'")]
 insert
     :: forall key val keys f. (MapEntry key val, Applicative f)
     => val
@@ -203,22 +212,51 @@ insert
 insert val = insert' @key (pure val)
 
 -- | Construct a singleton 'HashRecord'.
+--
+-- >>> singleton' @"hello" (Just "world")
+-- fromList [("hello", "Just \"world\"")]
 singleton'
     :: forall key val f. (Applicative f, MapEntry key val)
     => f val -> HashRecord' f '[key =: val]
 singleton' v = insert' @key v empty'
 
--- | Construct a singleton 'HashRecord'.
+-- | Construct a singleton 'HashRecord''. Since this is polymorphic in the @f@
+-- parameter, this may require a type annotation. Consider using 'singletonI',
+-- which defaults this to 'Identity'.
+--
+-- >>> :t singleton @"hello" "world"
+-- singleton @"hello" "world"
+--   :: Applicative f => HashRecord' f ["foo" =: String]
 singleton
     :: forall key val f. (Applicative f, MapEntry key val)
     => val -> HashRecord' f '[key =: val]
 singleton v = insert @key v empty'
+
+-- | Construct a singleton 'HashRecord'.
+--
+-- >>> singleton @"foo" (3 :: Int)
+-- fromList [("foo", "3")]
+singletonI
+    :: forall key val. MapEntry key val
+    => val -> HashRecord '[key =: val]
+singletonI v = insert @key v empty
+
 
 -- | Looks up the given key in a 'HashRecord''. Intended to be used with
 -- TypeApplications.
 --
 -- >>> Rec.lookup @"foo" (Rec.insert @"foo" 'a' Rec.empty)
 -- 'a'
+lookup
+    :: forall key val keys.
+    ( MapEntry key val
+    , Lookup key keys ~ val
+    )
+    => HashRecord keys
+    -> val
+lookup = runIdentity . lookup' @key
+
+-- | A more general version of 'lookup'.
 lookup'
     :: forall key val keys f.
     ( MapEntry key val
@@ -229,31 +267,6 @@ lookup'
     -> f val
 lookup' = unsafeLookup @key "lookup" . getHashRecord
 
-lookup
-    :: forall key val keys.
-    ( MapEntry key val
-    , Lookup key keys ~ val
-    )
-    => HashRecord keys
-    -> val
-lookup = runIdentity . lookup' @key
-
--- | Seriously, don't do this.
-unsafeLookup
-    :: forall k v f. (MapEntry k v, Functor f)
-    => String -- ^ The string note to call 'error' with when you done goofed
-    -> HashMap String (f Dynamic) -- ^ The raw record.
-    -> f v -- ^ The value. This can totally error. Beware!
-unsafeLookup err =
-    fmap
-        ( fromMaybe (oops "value did not have the right type: ")
-        . fromDynamic
-        )
-    . fromMaybe (oops "key did not exist in map: ")
-    . Map.lookup (symbolVal (Proxy @k))
-  where
-    oops :: forall a. String -> a
-    oops e = error ("HashRecord'.unsafeLookup: " ++ e ++ err)
 
 delete
     :: forall key val keys f.
@@ -283,15 +296,16 @@ union (HashRecord r0) (HashRecord r1) = HashRecord (Map.union r0 r1)
 rmap :: (forall a. f a -> g a) -> HashRecord' f keys -> HashRecord' g keys
 rmap nat = HashRecord . Map.map nat . getHashRecord
 
+-- | Given a function which transforms an @f a@ into an @h (g a)@, this function
+-- applies that to each value in the 'HashRecord''. The @h@ type constructor is
+-- then pulled out from each of the values, and the @g@ type constructor
+-- replaces the @f@ in @'Hashrecord'' f keys@.
 rtraverse
     :: Applicative h
     => (forall a. f a -> h (g a))
     -> HashRecord' f keys
     -> h (HashRecord' g keys)
 rtraverse k = fmap HashRecord . traverse k . getHashRecord
-
-testMaybeMap :: HashRecord' Maybe '["foo" =: Int]
-testMaybeMap = insert' @"foo" Nothing empty'
 
 -- | 'field' provides a lens into a 'HashRecord'', which lets you use all the fun
 -- lens functions like 'view', 'over', 'set', etc.
@@ -319,6 +333,29 @@ field afb (HashRecord record) =
                 (symbolVal (Proxy @key))
                 record
 
+-- | A type constrained variant of 'field'.
+field_
+    :: forall key val keys.
+    ( MapEntry key val
+    , Lookup key keys ~ val
+    , UpdateAt key val keys ~ keys
+    )
+    => Lens' (HashRecord keys) val
+field_ = field @key
+
+-- | A more general variant of 'field'. Use this when you want to target the @f@
+-- type constructor. This is useful for editing the presence/abscence of values
+-- in a @'HashRecord'' 'Maybe'@, or editing the validation of values in
+-- a @'HashRecord'' ('Either' 'String')@.
+--
+-- Note that the second type parameter *can* change, so setting a field to
+-- 'Nothing' isn't guaranteed to keep the same type you expect. Indeed, it will
+-- default to @Typeable val2 => Maybe val2@! Supply a type annotation or use
+-- a limited variant of this function.
+--
+-- >>> let exampleField = insert' @"foo" (Just 'a') empty'
+-- >>> exampleField & field' @"foo" .~ Nothing
+-- fromList [("foo", "Nothing")]
 field'
     :: forall key val1 val2 keys keys' f.
     ( MapEntry key val1
@@ -333,6 +370,17 @@ field' afb (HashRecord record) =
         HashRecord (Map.update (k newVal) (symbolVal (Proxy @key)) record)
   where
     k newVal = Just . const (fmap toDyn newVal)
+
+-- | A type constrained variant of 'field''.
+field_'
+    :: forall key val keys f.
+    ( MapEntry key val
+    , Lookup key keys ~ val
+    , UpdateAt key val keys ~ keys
+    , Functor f
+    )
+    => Lens' (HashRecord' f keys) (f val)
+field_' = field' @key
 
 -- | This updates the value stored in the 'HashRecord'', potentially
 -- changing it's type. Unlike 'Data.HashMap.Strict.update', this function
@@ -428,3 +476,40 @@ type family UnionHelper acc xs ys where
     UnionHelper acc '[] '[] = acc
     UnionHelper acc (k =: v ': xs) ys = UnionHelper (InsertSorted k v acc) xs ys
     UnionHelper acc '[] (k =: v ': xs) = UnionHelper (InsertSorted k v acc) '[] xs
+
+
+
+-- | Seriously, don't do this.
+unsafeLookup
+    :: forall k v f. (MapEntry k v, Functor f)
+    => String -- ^ The string note to call 'error' with when you done goofed
+    -> HashMap String (f Dynamic) -- ^ The raw record.
+    -> f v -- ^ The value. This can totally error. Beware!
+unsafeLookup err =
+    fromMaybe (oops "key did not exist in map: ") . lessUnsafeLookup @k err
+  where
+    oops :: forall a. String -> a
+    oops e = error $ concat
+        [ "HashRecord'.unsafeLookup: ",  e,  err, " (key: ", sym, ")"]
+
+    sym :: String
+    sym = symbolVal (Proxy @k)
+
+lessUnsafeLookup
+    :: forall k v f. (MapEntry k v, Functor f)
+    => String -- ^ The string note to call 'error' with when you done goofed
+    -> HashMap String (f Dynamic) -- ^ The raw record.
+    -> Maybe (f v) -- ^ The value. This can totally error. Beware!
+lessUnsafeLookup err =
+    (fmap . fmap)
+        ( fromMaybe (oops "value did not have the right type: ")
+        . fromDynamic
+        )
+    . Map.lookup sym
+  where
+    oops :: forall a. String -> a
+    oops e = error $ concat
+        [ "HashRecord'.lessUnsafeLookup: " , e, err, " (key: ", sym, ")" ]
+
+    sym :: String
+    sym = symbolVal (Proxy @k)
