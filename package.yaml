@@ -17,6 +17,7 @@ dependencies:
   - aeson
   - text
   - lens
+  - hashable
 
 ghc-options:
   - -Wall -fno-warn-unused-do-bind

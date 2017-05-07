@@ -34,7 +34,9 @@ import           Data.Aeson
 import           Data.Aeson.Types
 import           Data.Dynamic         (Dynamic, Proxy (..), Typeable,
                                        fromDynamic, toDyn)
+import           Data.Foldable
 import           Data.Functor.Classes
+import           Data.Hashable
 import           Data.HashMap.Strict  (HashMap)
 import qualified Data.HashMap.Strict  as Map
 import           Data.Maybe           (fromMaybe)
@@ -182,8 +184,8 @@ instance
 -- expect this to perform a 'union' of the records. Instead, the instance lifts
 -- the monoid into the records. The empty case always produces an empty record:
 -- appending two empty records always yields an empty record
-instance Monoid (HashRecord' f '[]) where
-    mempty = HashRecord mempty
+instance Monoid (Pointwise (HashRecord' f '[])) where
+    mempty = Pointwise (HashRecord mempty)
     mappend _ _ = mempty
 
 -- | For a 'HashRecord'' that contains entries, we require that these entries be
@@ -193,17 +195,17 @@ instance
     ( Applicative f
     , Monoid val
     , MapEntry key val
-    , Monoid (HashRecord' f xs)
-    ) => Monoid (HashRecord' f (key =: val ': xs)) where
+    , Monoid (Pointwise (HashRecord' f xs))
+    ) => Monoid (Pointwise (HashRecord' f (key =: val ': xs))) where
     mempty =
-        HashRecord (Map.insert k (toDyn <$> v) rest)
+        Pointwise (HashRecord (Map.insert k (toDyn <$> v) rest))
       where
         v = pure mempty :: f val
         k = symbolVal (Proxy @key)
-        HashRecord rest = mempty :: HashRecord' f xs
+        Pointwise (HashRecord rest) = mempty :: Pointwise (HashRecord' f xs)
 
-    mappend (HashRecord rec1) (HashRecord rec2) =
-        HashRecord (Map.unionWith (liftA2 k) rec1 rec2)
+    Pointwise (HashRecord rec1) `mappend` Pointwise (HashRecord rec2) =
+        Pointwise (HashRecord (Map.unionWith (liftA2 k) rec1 rec2))
       where
         k d1 d2 = toDyn (fromDyn_ d1 <> fromDyn_ d2 :: val)
         fromDyn_ =
@@ -211,32 +213,31 @@ instance
             . fromDynamic
 
 -- | A newtype wrapper around 'HashRecord'' that's used to provide an
--- alternative 'Monoid' instance.
-newtype Structurally a = Structurally { unStructurally :: a }
+-- alternative 'Monoid' instance. The default monoid instance combines elements
+-- pointwise. This one relies on the 'Alternative' structure of the @f@
+-- parameter to the 'HashRecord''.
+newtype Pointwise a = Pointwise { unPointwise :: a }
     deriving (Show, Eq, Ord)
 
-instance Monoid (Structurally (HashRecord' f '[])) where
-    mempty = Structurally empty'
+instance Monoid (HashRecord' f '[]) where
+    mempty = empty'
     a `mappend` _ =
         a
 
 instance
     ( A.Alternative f
     , MapEntry key val
-    , Functor f
-    , Monoid (Structurally (HashRecord' f xs))
-    ) => Monoid (Structurally (HashRecord' f (key =: val ': xs))) where
-    mempty = Structurally (HashRecord rec)
+    , Monoid (HashRecord' f xs)
+    ) => Monoid (HashRecord' f (key =: val ': xs)) where
+    mempty = HashRecord rec
       where
         v = A.empty :: f val
         this =
             Map.singleton (symbolVal (Proxy @key)) (toDyn <$> v)
-        Structurally (HashRecord rest) =
-            mempty :: Structurally (HashRecord' f xs)
+        HashRecord rest = mempty :: HashRecord' f xs
         rec = Map.union this rest
 
-    Structurally (HashRecord rec0) `mappend` Structurally (HashRecord rec1) =
-        Structurally (HashRecord result)
+    HashRecord rec0 `mappend` HashRecord rec1 = HashRecord result
       where
         val0 :: f val
         val0 = unsafeLookup @key "mappend val0" rec0
@@ -244,9 +245,9 @@ instance
         val1 = unsafeLookup @key "mappend val1" rec1
         val = val0 A.<|> val1
         result = Map.insert (symbolVal (Proxy @key)) (toDyn <$> val) rest
-        mkRest :: HashMap String (f Dynamic) -> Structurally (HashRecord' f xs)
-        mkRest rec = Structurally (HashRecord rec)
-        Structurally (HashRecord rest) = mkRest rec0 <> mkRest rec1
+        mkRest :: HashMap String (f Dynamic) -> HashRecord' f xs
+        mkRest rec = HashRecord rec
+        HashRecord rest = mkRest rec0 <> mkRest rec1
 
 -- | Construct an empty 'HashRecord'.
 empty :: HashRecord '[]
@@ -359,6 +360,102 @@ testMap = insert @"foo" 'a' empty
 -- | Take the union of the two maps. This function is left biased,
 union :: HashRecord' f keys1 -> HashRecord' f keys2 -> HashRecord' f (Union keys1 keys2)
 union (HashRecord r0) (HashRecord r1) = HashRecord (Map.union r0 r1)
+
+intersection
+    :: HashRecord' f keys1
+    -> HashRecord' f keys2
+    -> HashRecord' f (Intersection keys1 keys2)
+intersection (HashRecord r0) (HashRecord r1) =
+    HashRecord (Map.intersection r0 r1)
+
+-- | 'project' takes a record and restricts the available fields. Provide a type
+-- level list of 'Symbol's to preserve in the original record.
+--
+-- >>> let testRec = mempty :: HashRecord ["foo" =: String, "bar" =: First Int, "baz" =: [Int]]
+-- >>> project @["foo", "bar"] testRec
+-- fromList [("foo", "Identity \"\""),("bar", "Identity (First { getFirst = Nothing })")]
+project
+    :: forall projections keys f
+    . HashRecord' f keys
+    -> HashRecord' f (Project projections keys)
+project (HashRecord rec) = HashRecord rec
+
+-- | Restrict a collection of records based on the given field. This function is
+-- made parametric in the filtering operation, allowing you to restrict a wide
+-- variety of container types.
+restrictGeneric
+    :: forall key val keys f t.
+    ( Lookup key keys ~ val
+    , Functor f
+    , Foldable f
+    , MapEntry key val
+    )
+    => (forall x. (x -> Bool) -> t x -> t x)
+    -> (val -> Bool)
+    -> t (HashRecord' f keys)
+    -> t (HashRecord' f keys)
+restrictGeneric filter' p = filter' (all p . lookup' @key)
+
+-- | Restrict a list of records based on the provided field.
+--
+-- >>> restrict @"foo" (<3) [singleton @"foo" 5]
+-- []
+restrict
+    :: forall key val keys f.
+    ( Lookup key keys ~ val
+    , Functor f
+    , Foldable f
+    , MapEntry key val
+    )
+    => (val -> Bool)
+    -> [HashRecord' f keys]
+    -> [HashRecord' f keys]
+restrict = restrictGeneric @key filter
+
+-- | Given two 'Foldable' containers of 'HashRecord's that share a @key '=:'
+-- val@ pair and a function that indicates whether two records should be joined,
+-- this function creates a list of 'HashRecord's where the keys are a union of
+-- the two original sets of keys. The values are presented
+innerJoinWhere
+    :: forall key keys0 keys1 val f t.
+    ( Foldable t
+    , MapEntry key val
+    , Applicative f
+    , Lookup key keys0 ~ val
+    , Lookup key keys1 ~ val
+    )
+    => (val -> val -> Bool)
+    -> t (HashRecord' f keys0)
+    -> t (HashRecord' f keys1)
+    -> [HashRecord' f (InnerJoin key val keys0 keys1)]
+innerJoinWhere p recs0 recs1 = undefined
+  where
+    key = symbolVal (Proxy @key)
+    recs0map :: HashMap String (f val, HashRecord' f keys0)
+    recs0map = foldMap (\rec -> Map.singleton key (lookup' @key rec, rec)) recs0
+    recs1map :: HashMap String (f val, HashRecord' f keys1)
+    recs1map = foldMap (\rec -> Map.singleton key (lookup' @key rec, rec)) recs1
+
+
+innerJoin
+    :: forall key keys0 keys1 val t.
+    ( Foldable t
+    , MapEntry key val
+    , Lookup key keys0 ~ val
+    , Lookup key keys1 ~ val
+    , Hashable val
+    , Eq val
+    )
+    => t (HashRecord keys0)
+    -> t (HashRecord keys1)
+    -> [HashRecord (InnerJoin key val keys0 keys1)]
+innerJoin recs0 recs1 = undefined
+  where
+    key = symbolVal (Proxy @key)
+    recs0map = foldr (\rec -> Map.insertWith (<>) (lookup @key rec) [rec]) Map.empty recs0
+    recs1map = foldr (\rec -> Map.insertWith (<>) (lookup @key rec) [rec]) Map.empty recs1
+    -- result = Map.unionWith k recs0map recs1map
+    -- k = undefined
 
 -- | Given a function that can transform an @f a@ into a @g a@ without any
 -- knowledge of the @a@s inside the @f@ (aka a Natural Transformation), map that
@@ -553,6 +650,28 @@ type family UnionHelper acc xs ys where
     UnionHelper acc '[]            (k =: v ': xs) =
         UnionHelper (InsertSorted k v acc) '[] xs
 
+type family Intersection xs ys where
+    Intersection '[] xs = '[]
+    Intersection (k =: v ': xs) ys =
+        ElemInsert k v ys (Intersection xs ys)
+
+type family ElemInsert key val keys rest where
+    ElemInsert key val '[] rest = rest
+    ElemInsert key val (key =: val ': _) rest = InsertSorted key val rest
+    ElemInsert key val (key =: val0 ': _) rest = TypeError ('Text "nope, must have the same type")
+    ElemInsert key val (_ ': xs) rest = ElemInsert key val xs rest
+
+type family Project projection original where
+    Project '[] org = '[]
+    Project (k ': xs) org =
+        ErrIfNotPresent k org ': Project xs org
+
+type family ErrIfNotPresent k xs where
+    ErrIfNotPresent k '[] = TypeError ('Text "k =: v not present in projection")
+    ErrIfNotPresent k (k =: v ': _) = k =: v
+    ErrIfNotPresent k (_ ': xs) = ErrIfNotPresent k xs
+
+type InnerJoin key val xs ys = InsertSorted key val (Union (Remove key xs) (Remove key ys))
 
 
 -- | Seriously, don't do this.
