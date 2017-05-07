@@ -27,6 +27,8 @@ changes in here will /not/ be reflected in the major API version.
 -}
 module Data.HashRecord.Internal where
 
+import           Control.Applicative  (liftA2)
+import qualified Control.Applicative  as A
 import           Control.Lens         hiding ((.=))
 import           Data.Aeson
 import           Data.Aeson.Types
@@ -36,6 +38,7 @@ import           Data.Functor.Classes
 import           Data.HashMap.Strict  (HashMap)
 import qualified Data.HashMap.Strict  as Map
 import           Data.Maybe           (fromMaybe)
+import           Data.Monoid
 import qualified Data.Text            as Text
 import           GHC.TypeLits         (CmpSymbol, ErrorMessage (..),
                                        KnownSymbol, Symbol, TypeError,
@@ -174,6 +177,76 @@ instance
         val :: v <- o .: Text.pack key
         HashRecord rest :: HashRecord' f xs <- parseJSON (Object o)
         pure (HashRecord (Map.insert key (pure (toDyn val)) rest))
+
+-- The 'Monoid' instance for 'HashRecord'' is a little unintuitive. You might
+-- expect this to perform a 'union' of the records. Instead, the instance lifts
+-- the monoid into the records. The empty case always produces an empty record:
+-- appending two empty records always yields an empty record
+instance Monoid (HashRecord' f '[]) where
+    mempty = HashRecord mempty
+    mappend _ _ = mempty
+
+-- | For a 'HashRecord'' that contains entries, we require that these entries be
+-- the same. For each element in the two records, we combine them using 'mappend'.
+-- This is lifted over the 'Applicative' structure @f@ used in record.
+instance
+    ( Applicative f
+    , Monoid val
+    , MapEntry key val
+    , Monoid (HashRecord' f xs)
+    ) => Monoid (HashRecord' f (key =: val ': xs)) where
+    mempty =
+        HashRecord (Map.insert k (toDyn <$> v) rest)
+      where
+        v = pure mempty :: f val
+        k = symbolVal (Proxy @key)
+        HashRecord rest = mempty :: HashRecord' f xs
+
+    mappend (HashRecord rec1) (HashRecord rec2) =
+        HashRecord (Map.unionWith (liftA2 k) rec1 rec2)
+      where
+        k d1 d2 = toDyn (fromDyn_ d1 <> fromDyn_ d2 :: val)
+        fromDyn_ =
+            fromMaybe (error "Fail to convert type in mappend")
+            . fromDynamic
+
+-- | A newtype wrapper around 'HashRecord'' that's used to provide an
+-- alternative 'Monoid' instance.
+newtype Structurally a = Structurally { unStructurally :: a }
+    deriving (Show, Eq, Ord)
+
+instance Monoid (Structurally (HashRecord' f '[])) where
+    mempty = Structurally empty'
+    a `mappend` _ =
+        a
+
+instance
+    ( A.Alternative f
+    , MapEntry key val
+    , Functor f
+    , Monoid (Structurally (HashRecord' f xs))
+    ) => Monoid (Structurally (HashRecord' f (key =: val ': xs))) where
+    mempty = Structurally (HashRecord rec)
+      where
+        v = A.empty :: f val
+        this =
+            Map.singleton (symbolVal (Proxy @key)) (toDyn <$> v)
+        Structurally (HashRecord rest) =
+            mempty :: Structurally (HashRecord' f xs)
+        rec = Map.union this rest
+
+    Structurally (HashRecord rec0) `mappend` Structurally (HashRecord rec1) =
+        Structurally (HashRecord result)
+      where
+        val0 :: f val
+        val0 = unsafeLookup @key "mappend val0" rec0
+        val1 :: f val
+        val1 = unsafeLookup @key "mappend val1" rec1
+        val = val0 A.<|> val1
+        result = Map.insert (symbolVal (Proxy @key)) (toDyn <$> val) rest
+        mkRest :: HashMap String (f Dynamic) -> Structurally (HashRecord' f xs)
+        mkRest rec = Structurally (HashRecord rec)
+        Structurally (HashRecord rest) = mkRest rec0 <> mkRest rec1
 
 -- | Construct an empty 'HashRecord'.
 empty :: HashRecord '[]
@@ -473,9 +546,12 @@ type family SortHelper xs ys where
 type Union xs ys = UnionHelper '[] xs ys
 
 type family UnionHelper acc xs ys where
-    UnionHelper acc '[] '[] = acc
-    UnionHelper acc (k =: v ': xs) ys = UnionHelper (InsertSorted k v acc) xs ys
-    UnionHelper acc '[] (k =: v ': xs) = UnionHelper (InsertSorted k v acc) '[] xs
+    UnionHelper acc '[]            '[] =
+        acc
+    UnionHelper acc (k =: v ': xs) ys  =
+        UnionHelper (InsertSorted k v acc) xs ys
+    UnionHelper acc '[]            (k =: v ': xs) =
+        UnionHelper (InsertSorted k v acc) '[] xs
 
 
 
